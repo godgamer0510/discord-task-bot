@@ -34,15 +34,12 @@ class RoomsCog(commands.Cog):
         guild = interaction.guild
         category = interaction.channel.category
 
-        # カテゴリが見つからない場合のフォールバック
         if not category:
             await interaction.response.send_message("カテゴリが見つかりません。適当なカテゴリ内で実行してください。", ephemeral=True)
             return
 
-        # VC作成
         vc = await guild.create_voice_channel(name=f"🔊 {name}", category=category)
         
-        # コントロールパネルの送信 (VC内のテキストチャットへ)
         embed = discord.Embed(
             title="🛠 会議室コントロール",
             description="このチャンネルは使い捨てです。用が済んだら削除ボタンを押してください。",

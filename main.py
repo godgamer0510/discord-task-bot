@@ -15,19 +15,16 @@ class MyBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # データベース初期化
         await db.init_db()
         
-        # Cogsのロード
+        # Cogsのロード (settingsを追加)
         await self.load_extension("cogs.tickets")
         await self.load_extension("cogs.rooms")
+        await self.load_extension("cogs.settings") # <--- NEW
         
-        # Persistent Viewの登録
-        # Bot再起動後もボタンが反応するように、ここでViewクラスを登録する
         self.add_view(TicketView())
         self.add_view(RoomControlView())
         
-        # コマンド同期
         await self.tree.sync()
         print("--- System Online: Commands synced & Views registered ---")
 

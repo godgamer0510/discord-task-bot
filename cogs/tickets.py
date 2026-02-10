@@ -1,11 +1,15 @@
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from database import db
+from dateutil import parser
+import datetime
+
+# 日本時間 (JST) 定義
+JST = datetime.timezone(datetime.timedelta(hours=9))
 
 class TicketView(discord.ui.View):
     def __init__(self):
-        # timeout=None は永続Viewの必須要件
         super().__init__(timeout=None)
 
     async def update_event_message(self, interaction: discord.Interaction, message_id: int):
@@ -18,7 +22,6 @@ class TicketView(discord.ui.View):
         current_count = len(participants)
         required = event_info['required_num']
         
-        # ステータス判定ロジック
         if current_count >= required:
             color = discord.Color.green()
             status_text = "✅ **決行決定 (人員確保済)** - 準備を進めてください"
@@ -26,7 +29,6 @@ class TicketView(discord.ui.View):
             color = discord.Color.orange()
             status_text = f"⚠ **募集中** - あと {required - current_count} 枚必要です"
 
-        # Embed再構築
         embed = discord.Embed(title=f"📋 {event_info['title']}", color=color)
         embed.add_field(name="📅 日時", value=event_info['date_str'], inline=True)
         embed.add_field(name="📍 場所", value=event_info['location'], inline=True)
@@ -39,23 +41,40 @@ class TicketView(discord.ui.View):
 
         await interaction.message.edit(embed=embed, view=self)
 
-    # custom_id を固定することで、Bot再起動後もハンドラを紐付けられる
     @discord.ui.button(label="チケットを取る (参加)", style=discord.ButtonStyle.primary, emoji="🎫", custom_id="ticket:join")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button):
         msg_id = interaction.message.id
         
-        # 既に定員かチェック（オプション: 定員超えを許可するならここは緩める）
         event_info, participants = await db.get_event_data(msg_id)
         if len(participants) >= event_info['required_num']:
-            # 自分が参加済みでなければエラー、参加済みならスルー（連打対策）
             if interaction.user.id not in participants:
                 await interaction.response.send_message("定員に達しています！", ephemeral=True)
                 return
 
         success = await db.add_participant(msg_id, interaction.user.id)
+        
         if success:
             await self.update_event_message(interaction, msg_id)
             await interaction.response.send_message("チケットを発行しました！", ephemeral=True)
+
+            # DM通知ロジック (決行決定時)
+            event_info, new_participants = await db.get_event_data(msg_id)
+            if len(new_participants) == event_info['required_num']:
+                notify_text = (
+                    f"🎉 **決行決定のお知らせ**\n\n"
+                    f"案件「**{event_info['title']}**」のメンバーが集まりました！\n"
+                    f"日時: {event_info['date_str']}\n"
+                    f"場所: {event_info['location']}\n\n"
+                    f"作業の準備をお願いします！"
+                )
+                guild = interaction.guild
+                for uid in new_participants:
+                    member = guild.get_member(uid)
+                    if member:
+                        try:
+                            await member.send(notify_text)
+                        except discord.Forbidden:
+                            pass
         else:
             await interaction.response.send_message("既にチケットを持っています。", ephemeral=True)
 
@@ -68,16 +87,13 @@ class TicketView(discord.ui.View):
 
     @discord.ui.button(label="管理者削除", style=discord.ButtonStyle.danger, custom_id="ticket:delete")
     async def delete_event(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 権限チェック (作成者のみ、または管理者権限)
         event_info, _ = await db.get_event_data(interaction.message.id)
         if not event_info:
             await interaction.message.delete()
             return
-
         if interaction.user.id != event_info['owner_id'] and not interaction.user.guild_permissions.administrator:
-            await interaction.response.send_message("削除権限がありません（作成者のみ削除可）。", ephemeral=True)
+            await interaction.response.send_message("削除権限がありません。", ephemeral=True)
             return
-
         await db.delete_event(interaction.message.id)
         await interaction.message.delete()
         await interaction.response.send_message("募集を削除しました。", ephemeral=True)
@@ -85,7 +101,7 @@ class TicketView(discord.ui.View):
 
 class RecruitModal(discord.ui.Modal, title="タスク募集チケットの発行"):
     task_name = discord.ui.TextInput(label="タスク・作業内容", style=discord.TextStyle.short)
-    date_str = discord.ui.TextInput(label="日時", placeholder="例: 10/25 13:00~")
+    date_str = discord.ui.TextInput(label="日時 (例: 2026/02/15 21:00)", placeholder="YYYY/MM/DD HH:MM の形式推奨")
     location = discord.ui.TextInput(label="場所・マップURL", placeholder="GoogleMap URLなど")
     required_num = discord.ui.TextInput(label="必要人数", placeholder="数字のみ (例: 3)", min_length=1, max_length=2)
 
@@ -96,6 +112,21 @@ class RecruitModal(discord.ui.Modal, title="タスク募集チケットの発行
             await interaction.response.send_message("人数は半角数字で入力してください。", ephemeral=True)
             return
 
+        # 日付解析処理
+        try:
+            # 入力された文字列をJSTとして解釈し、Unixタイムスタンプ(UTC)に変換して保存
+            dt = parser.parse(self.date_str.value)
+            # タイムゾーン指定がない場合はJSTとみなす
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=JST)
+            timestamp = dt.timestamp()
+        except Exception:
+            # 解析失敗時はNone (リマインダー機能は無効化されるが募集は作れる)
+            timestamp = None
+            warning_msg = "\n⚠ 日時形式を認識できなかったため、リマインダー機能は無効です (募集は作成されます)。"
+        else:
+            warning_msg = ""
+
         embed = discord.Embed(title=f"📋 {self.task_name.value}", color=discord.Color.orange())
         embed.add_field(name="📅 日時", value=self.date_str.value, inline=True)
         embed.add_field(name="📍 場所", value=self.location.value, inline=True)
@@ -103,11 +134,12 @@ class RecruitModal(discord.ui.Modal, title="タスク募集チケットの発行
         embed.add_field(name="ステータス", value="⚠ **募集中**", inline=False)
         embed.set_footer(text="Initializing...")
 
-        # 先にメッセージを送信してIDを確定させる
         await interaction.response.send_message(embed=embed, view=TicketView())
         msg = await interaction.original_response()
+        
+        if warning_msg:
+             await interaction.followup.send(warning_msg, ephemeral=True)
 
-        # DBに保存
         await db.create_event(
             message_id=msg.id,
             channel_id=interaction.channel_id,
@@ -116,16 +148,78 @@ class RecruitModal(discord.ui.Modal, title="タスク募集チケットの発行
             title=self.task_name.value,
             date_str=self.date_str.value,
             location=self.location.value,
-            required_num=req_num
+            required_num=req_num,
+            start_timestamp=timestamp
         )
 
 class TicketsCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
+        self.reminder_loop.start() # ループ開始
+
+    def cog_unload(self):
+        self.reminder_loop.cancel()
 
     @app_commands.command(name="recruit", description="作業・タスクの募集チケットを発行します")
     async def recruit(self, interaction: discord.Interaction):
         await interaction.response.send_modal(RecruitModal())
+
+    # --- 1分ごとの監視ループ ---
+    @tasks.loop(minutes=1)
+    async def reminder_loop(self):
+        try:
+            events = await db.get_upcoming_events()
+            now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+            for event in events:
+                # サーバーごとの通知設定を取得
+                minutes_before = await db.get_guild_notify_time(event['guild_id'])
+                notify_threshold = minutes_before * 60 # 秒換算
+
+                # 開始時間 - 今の時間 <= 設定時間 (例: 残り15分を切った)
+                time_until_start = event['start_timestamp'] - now
+
+                if 0 < time_until_start <= notify_threshold:
+                    # 通知対象！
+                    await self.send_reminder(event)
+                    await db.mark_notification_sent(event['message_id'])
+                
+                # 既に過ぎてしまったイベントも通知済み扱いにしてDB負荷を下げる
+                elif time_until_start <= 0:
+                    await db.mark_notification_sent(event['message_id'])
+
+        except Exception as e:
+            print(f"Loop Error: {e}")
+
+    async def send_reminder(self, event):
+        # 参加者リスト取得
+        _, participants = await db.get_event_data(event['message_id'])
+        if not participants:
+            return
+
+        guild = self.bot.get_guild(event['guild_id'])
+        if not guild: return
+
+        # 通知テキスト
+        text = (
+            f"⏰ **まもなく開始です！**\n\n"
+            f"案件: **{event['title']}**\n"
+            f"時間: {event['date_str']}\n"
+            f"場所: {event['location']}\n\n"
+            f"集合をお願いします！"
+        )
+
+        for uid in participants:
+            member = guild.get_member(uid)
+            if member:
+                try:
+                    await member.send(text)
+                except discord.Forbidden:
+                    pass
+
+    @reminder_loop.before_loop
+    async def before_reminder(self):
+        await self.bot.wait_until_ready()
 
 async def setup(bot):
     await bot.add_cog(TicketsCog(bot))
