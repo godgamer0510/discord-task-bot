@@ -4,6 +4,9 @@ from discord.ext import commands, tasks
 from database import db
 from dateutil import parser
 import datetime
+import asyncio
+import random
+import string
 
 # 日本時間 (JST) 定義
 JST = datetime.timezone(datetime.timedelta(hours=9))
@@ -22,6 +25,9 @@ class TicketView(discord.ui.View):
         current_count = len(participants)
         required = event_info['required_num']
         
+        mode_map = {'normal': '通常', 'many': '多め', 'brutal': '🔥鬼畜🔥'}
+        mode_str = mode_map.get(event_info.get('reminder_mode', 'normal'), '通常')
+
         if current_count >= required:
             color = discord.Color.green()
             status_text = "✅ **決行決定 (人員確保済)** - 準備を進めてください"
@@ -32,6 +38,7 @@ class TicketView(discord.ui.View):
         embed = discord.Embed(title=f"📋 {event_info['title']}", color=color)
         embed.add_field(name="📅 日時", value=event_info['date_str'], inline=True)
         embed.add_field(name="📍 場所", value=event_info['location'], inline=True)
+        embed.add_field(name="🔔 通知モード", value=mode_str, inline=True)
         embed.add_field(name="👥 チケット状況", value=f"目標: {required}枚 / **現在: {current_count}枚**", inline=False)
         embed.add_field(name="ステータス", value=status_text, inline=False)
         
@@ -104,6 +111,14 @@ class RecruitModal(discord.ui.Modal, title="タスク募集チケットの発行
     date_str = discord.ui.TextInput(label="日時 (例: 2026/02/15 21:00)", placeholder="YYYY/MM/DD HH:MM の形式推奨")
     location = discord.ui.TextInput(label="場所・マップURL", placeholder="GoogleMap URLなど")
     required_num = discord.ui.TextInput(label="必要人数", placeholder="数字のみ (例: 3)", min_length=1, max_length=2)
+    # 5つ目の項目を追加 (Discord Modalの上限は5つ)
+    reminder_mode = discord.ui.TextInput(
+        label="通知モード (1:通常, 2:多め, 3:鬼畜)", 
+        placeholder="1, 2, 3 のいずれかを入力", 
+        default="1",
+        min_length=1, 
+        max_length=1
+    )
 
     async def on_submit(self, interaction: discord.Interaction):
         try:
@@ -112,16 +127,25 @@ class RecruitModal(discord.ui.Modal, title="タスク募集チケットの発行
             await interaction.response.send_message("人数は半角数字で入力してください。", ephemeral=True)
             return
 
+        # モード判定
+        mode_val = self.reminder_mode.value.strip()
+        if mode_val == "2":
+            mode = "many"
+            mode_display = "多め"
+        elif mode_val == "3":
+            mode = "brutal"
+            mode_display = "🔥鬼畜🔥"
+        else:
+            mode = "normal"
+            mode_display = "通常"
+
         # 日付解析処理
         try:
-            # 入力された文字列をJSTとして解釈し、Unixタイムスタンプ(UTC)に変換して保存
             dt = parser.parse(self.date_str.value)
-            # タイムゾーン指定がない場合はJSTとみなす
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=JST)
             timestamp = dt.timestamp()
         except Exception:
-            # 解析失敗時はNone (リマインダー機能は無効化されるが募集は作れる)
             timestamp = None
             warning_msg = "\n⚠ 日時形式を認識できなかったため、リマインダー機能は無効です (募集は作成されます)。"
         else:
@@ -130,6 +154,7 @@ class RecruitModal(discord.ui.Modal, title="タスク募集チケットの発行
         embed = discord.Embed(title=f"📋 {self.task_name.value}", color=discord.Color.orange())
         embed.add_field(name="📅 日時", value=self.date_str.value, inline=True)
         embed.add_field(name="📍 場所", value=self.location.value, inline=True)
+        embed.add_field(name="🔔 通知モード", value=mode_display, inline=True)
         embed.add_field(name="👥 チケット状況", value=f"目標: {req_num}枚 / **現在: 0枚**", inline=False)
         embed.add_field(name="ステータス", value="⚠ **募集中**", inline=False)
         embed.set_footer(text="Initializing...")
@@ -149,20 +174,44 @@ class RecruitModal(discord.ui.Modal, title="タスク募集チケットの発行
             date_str=self.date_str.value,
             location=self.location.value,
             required_num=req_num,
-            start_timestamp=timestamp
+            start_timestamp=timestamp,
+            reminder_mode=mode
         )
 
 class TicketsCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.reminder_loop.start() # ループ開始
+        self.active_spams = {} # {message_id: {'task': Task, 'code': str}}
+        self.reminder_loop.start()
 
     def cog_unload(self):
         self.reminder_loop.cancel()
+        # 進行中のスパムタスクを全てキャンセル
+        for spam_data in self.active_spams.values():
+            spam_data['task'].cancel()
 
     @app_commands.command(name="recruit", description="作業・タスクの募集チケットを発行します")
     async def recruit(self, interaction: discord.Interaction):
         await interaction.response.send_modal(RecruitModal())
+
+    @app_commands.command(name="stop_spam", description="[鬼畜モード用] リマインダーを停止します")
+    @app_commands.describe(passphrase="Botが提示した解除コード")
+    async def stop_spam(self, interaction: discord.Interaction, passphrase: str):
+        # ユーザーが参加している、かつ現在スパム中のイベントを探す
+        target_event_id = None
+        
+        # 本来はDBチェックすべきですが、解除コードが一致すればOKとする簡易実装
+        for msg_id, data in self.active_spams.items():
+            if data['code'] == passphrase:
+                target_event_id = msg_id
+                break
+        
+        if target_event_id:
+            self.active_spams[target_event_id]['task'].cancel()
+            del self.active_spams[target_event_id]
+            await interaction.response.send_message("✅ リマインダーの停止に成功しました。遅れないように！", ephemeral=False)
+        else:
+            await interaction.response.send_message("❌ 解除コードが間違っているか、既に停止しています。", ephemeral=True)
 
     # --- 1分ごとの監視ループ ---
     @tasks.loop(minutes=1)
@@ -172,42 +221,40 @@ class TicketsCog(commands.Cog):
             now = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
             for event in events:
-                # サーバーごとの通知設定を取得
                 minutes_before = await db.get_guild_notify_time(event['guild_id'])
-                notify_threshold = minutes_before * 60 # 秒換算
+                notify_threshold = minutes_before * 60
 
-                # 開始時間 - 今の時間 <= 設定時間 (例: 残り15分を切った)
                 time_until_start = event['start_timestamp'] - now
 
                 if 0 < time_until_start <= notify_threshold:
-                    # 通知対象！
-                    await self.send_reminder(event)
+                    await self.dispatch_reminder(event)
                     await db.mark_notification_sent(event['message_id'])
                 
-                # 既に過ぎてしまったイベントも通知済み扱いにしてDB負荷を下げる
                 elif time_until_start <= 0:
                     await db.mark_notification_sent(event['message_id'])
 
         except Exception as e:
             print(f"Loop Error: {e}")
 
-    async def send_reminder(self, event):
-        # 参加者リスト取得
+    async def dispatch_reminder(self, event):
+        mode = event.get('reminder_mode', 'normal')
+        
+        if mode == 'normal':
+            await self.send_normal_reminder(event)
+        elif mode == 'many':
+            # 非同期で実行（ループを止めないため）
+            asyncio.create_task(self.send_many_reminders(event))
+        elif mode == 'brutal':
+            asyncio.create_task(self.start_brutal_spam(event))
+
+    async def send_normal_reminder(self, event):
         _, participants = await db.get_event_data(event['message_id'])
-        if not participants:
-            return
+        if not participants: return
 
         guild = self.bot.get_guild(event['guild_id'])
         if not guild: return
 
-        # 通知テキスト
-        text = (
-            f"⏰ **まもなく開始です！**\n\n"
-            f"案件: **{event['title']}**\n"
-            f"時間: {event['date_str']}\n"
-            f"場所: {event['location']}\n\n"
-            f"集合をお願いします！"
-        )
+        text = self.create_reminder_text(event, "⏰ **まもなく開始です！**")
 
         for uid in participants:
             member = guild.get_member(uid)
@@ -216,6 +263,100 @@ class TicketsCog(commands.Cog):
                     await member.send(text)
                 except discord.Forbidden:
                     pass
+
+    async def send_many_reminders(self, event):
+        """チャンネルとDMに複数回通知"""
+        _, participants = await db.get_event_data(event['message_id'])
+        if not participants: return
+
+        guild = self.bot.get_guild(event['guild_id'])
+        channel = guild.get_channel(event['channel_id']) if guild else None
+        
+        mentions = " ".join([f"<@{uid}>" for uid in participants])
+        text = self.create_reminder_text(event, "⏰ **[しつこめ通知] まもなく開始です！**")
+
+        # 3回繰り返す
+        for i in range(3):
+            # チャンネル通知
+            if channel:
+                try:
+                    await channel.send(f"{mentions}\n{text}")
+                except:
+                    pass
+            
+            # DM通知
+            for uid in participants:
+                member = guild.get_member(uid)
+                if member:
+                    try:
+                        await member.send(text)
+                    except:
+                        pass
+            
+            await asyncio.sleep(60) # 1分間隔
+
+    async def start_brutal_spam(self, event):
+        """解除コード入力まで無限メンション"""
+        _, participants = await db.get_event_data(event['message_id'])
+        if not participants: return
+
+        guild = self.bot.get_guild(event['guild_id'])
+        channel = guild.get_channel(event['channel_id']) if guild else None
+
+        # 解除コード生成 (長めのランダム文字列)
+        random_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
+        passphrase = f"I_WILL_ATTEND_THE_EVENT_IMMEDIATELY_{random_suffix}"
+        
+        # 警告送信
+        warning_msg = (
+            f"😈 **鬼畜リマインダー発動** 😈\n\n"
+            f"イベント「{event['title']}」の時間です。\n"
+            f"通知を止めるには、以下のコマンドを正確に入力してください（コピペ推奨）：\n"
+            f"```\n/stop_spam passphrase:{passphrase}\n```"
+        )
+        
+        mentions = " ".join([f"<@{uid}>" for uid in participants])
+
+        if channel:
+            await channel.send(f"{mentions}\n{warning_msg}")
+
+        # スパムタスク開始
+        task = asyncio.create_task(self.spam_loop(channel, mentions, participants, guild))
+        self.active_spams[event['message_id']] = {'task': task, 'code': passphrase}
+
+    async def spam_loop(self, channel, mentions_str, participant_ids, guild):
+        try:
+            while True:
+                # チャンネルでメンション
+                if channel:
+                    try:
+                        await channel.send(f"起きろ！！ {mentions_str} 時間だぞ！！")
+                    except:
+                        pass
+                
+                # DMでもメンション
+                for uid in participant_ids:
+                    member = guild.get_member(uid)
+                    if member:
+                        try:
+                            await member.send("⏰ 時間だ！起きろ！早く来い！ ⏰")
+                        except:
+                            pass
+                
+                # Discordのレートリミットを考慮しつつもウザい頻度で (約2秒)
+                await asyncio.sleep(2)
+        except asyncio.CancelledError:
+            if channel:
+                await channel.send("✅ リマインダーが停止されました。")
+
+    def create_reminder_text(self, event, header):
+        return (
+            f"{header}\n\n"
+            f"案件: **{event['title']}**\n"
+            f"時間: {event['date_str']}\n"
+            f"場所: {event['location']}\n\n"
+            f"集合をお願いします！"
+        )
 
     @reminder_loop.before_loop
     async def before_reminder(self):
