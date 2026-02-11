@@ -24,7 +24,8 @@ class Database:
                     required_num INTEGER,
                     status TEXT DEFAULT 'RECRUITING',
                     start_timestamp REAL,
-                    notification_sent INTEGER DEFAULT 0
+                    notification_sent INTEGER DEFAULT 0,
+                    reminder_mode TEXT DEFAULT 'normal'
                 )
             """)
             
@@ -38,7 +39,7 @@ class Database:
                 )
             """)
 
-            # 3. サーバー設定テーブル作成 (NEW)
+            # 3. サーバー設定テーブル作成
             await db.execute("""
                 CREATE TABLE IF NOT EXISTS guild_settings (
                     guild_id INTEGER PRIMARY KEY,
@@ -50,22 +51,27 @@ class Database:
             try:
                 await db.execute("ALTER TABLE events ADD COLUMN start_timestamp REAL")
             except Exception:
-                pass # 既に存在する場合は無視
+                pass 
             
             try:
                 await db.execute("ALTER TABLE events ADD COLUMN notification_sent INTEGER DEFAULT 0")
             except Exception:
                 pass
 
+            try:
+                await db.execute("ALTER TABLE events ADD COLUMN reminder_mode TEXT DEFAULT 'normal'")
+            except Exception:
+                pass
+
             await db.commit()
 
     # --- イベント関連 ---
-    async def create_event(self, message_id, channel_id, guild_id, owner_id, title, date_str, location, required_num, start_timestamp=None):
+    async def create_event(self, message_id, channel_id, guild_id, owner_id, title, date_str, location, required_num, start_timestamp=None, reminder_mode='normal'):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("""
-                INSERT INTO events (message_id, channel_id, guild_id, owner_id, title, date_str, location, required_num, start_timestamp, notification_sent)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-            """, (message_id, channel_id, guild_id, owner_id, title, date_str, location, required_num, start_timestamp))
+                INSERT INTO events (message_id, channel_id, guild_id, owner_id, title, date_str, location, required_num, start_timestamp, notification_sent, reminder_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+            """, (message_id, channel_id, guild_id, owner_id, title, date_str, location, required_num, start_timestamp, reminder_mode))
             await db.commit()
 
     async def add_participant(self, message_id, user_id):
@@ -100,12 +106,11 @@ class Database:
             await db.execute("DELETE FROM participants WHERE event_message_id = ?", (message_id,))
             await db.commit()
 
-    # --- リマインダー・設定関連 (NEW) ---
+    # --- リマインダー・設定関連 ---
     async def get_upcoming_events(self):
         """通知未送信かつ、時間が設定されているイベントを取得"""
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            # start_timestampが入っていて、notification_sentが0のもの
             async with db.execute("SELECT * FROM events WHERE start_timestamp IS NOT NULL AND notification_sent = 0") as cursor:
                 return [dict(row) for row in await cursor.fetchall()]
 
