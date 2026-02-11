@@ -7,6 +7,8 @@ import datetime
 import asyncio
 import random
 import string
+import io
+from PIL import Image, ImageDraw, ImageFont
 
 # 日本時間 (JST) 定義
 JST = datetime.timezone(datetime.timedelta(hours=9))
@@ -111,7 +113,6 @@ class RecruitModal(discord.ui.Modal, title="タスク募集チケットの発行
     date_str = discord.ui.TextInput(label="日時 (例: 2026/02/15 21:00)", placeholder="YYYY/MM/DD HH:MM の形式推奨")
     location = discord.ui.TextInput(label="場所・マップURL", placeholder="GoogleMap URLなど")
     required_num = discord.ui.TextInput(label="必要人数", placeholder="数字のみ (例: 3)", min_length=1, max_length=2)
-    # 5つ目の項目を追加 (Discord Modalの上限は5つ)
     reminder_mode = discord.ui.TextInput(
         label="通知モード (1:通常, 2:多め, 3:鬼畜)", 
         placeholder="1, 2, 3 のいずれかを入力", 
@@ -139,7 +140,6 @@ class RecruitModal(discord.ui.Modal, title="タスク募集チケットの発行
             mode = "normal"
             mode_display = "通常"
 
-        # 日付解析処理
         try:
             dt = parser.parse(self.date_str.value)
             if dt.tzinfo is None:
@@ -181,12 +181,12 @@ class RecruitModal(discord.ui.Modal, title="タスク募集チケットの発行
 class TicketsCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.active_spams = {} # {message_id: {'task': Task, 'code': str}}
+        # {message_id: {'task': Task, 'codes': {uid: code}, 'remaining': {uid}}}
+        self.active_spams = {} 
         self.reminder_loop.start()
 
     def cog_unload(self):
         self.reminder_loop.cancel()
-        # 進行中のスパムタスクを全てキャンセル
         for spam_data in self.active_spams.values():
             spam_data['task'].cancel()
 
@@ -195,25 +195,45 @@ class TicketsCog(commands.Cog):
         await interaction.response.send_modal(RecruitModal())
 
     @app_commands.command(name="stop_spam", description="[鬼畜モード用] リマインダーを停止します")
-    @app_commands.describe(passphrase="Botが提示した解除コード")
+    @app_commands.describe(passphrase="画像に表示されているコードを入力")
     async def stop_spam(self, interaction: discord.Interaction, passphrase: str):
-        # ユーザーが参加している、かつ現在スパム中のイベントを探す
-        target_event_id = None
+        user_id = interaction.user.id
         
-        # 本来はDBチェックすべきですが、解除コードが一致すればOKとする簡易実装
+        # ユーザーが参加しており、かつ現在スパム中のイベントを探す
+        target_event_id = None
+        target_data = None
+
         for msg_id, data in self.active_spams.items():
-            if data['code'] == passphrase:
+            # そのユーザーが解除待ちリスト(remaining)にいるか？
+            if user_id in data['remaining']:
                 target_event_id = msg_id
+                target_data = data
                 break
         
-        if target_event_id:
-            self.active_spams[target_event_id]['task'].cancel()
-            del self.active_spams[target_event_id]
-            await interaction.response.send_message("✅ リマインダーの停止に成功しました。遅れないように！", ephemeral=False)
-        else:
-            await interaction.response.send_message("❌ 解除コードが間違っているか、既に停止しています。", ephemeral=True)
+        if not target_data:
+            await interaction.response.send_message("❌ 現在、あなたを対象とした鬼畜リマインダーは動いていません（または既に解除済みです）。", ephemeral=True)
+            return
 
-    # --- 1分ごとの監視ループ ---
+        # コード照合
+        correct_code = target_data['codes'].get(user_id)
+        if correct_code and passphrase == correct_code:
+            # 正解
+            target_data['remaining'].remove(user_id)
+            await interaction.response.send_message("✅ 解除成功！Botはあなたへの攻撃を停止しました。（他の遅刻者への攻撃は続きます...）", ephemeral=False)
+            
+            # 全員解除されたかチェック
+            if not target_data['remaining']:
+                target_data['task'].cancel()
+                del self.active_spams[target_event_id]
+                try:
+                    channel = interaction.channel
+                    if channel:
+                        await channel.send("🎉 全員が起床しました。リマインダーを完全停止します。")
+                except:
+                    pass
+        else:
+            await interaction.response.send_message("❌ コードが間違っています！画像の文字を正確に入力してください。", ephemeral=True)
+
     @tasks.loop(minutes=1)
     async def reminder_loop(self):
         try:
@@ -242,7 +262,6 @@ class TicketsCog(commands.Cog):
         if mode == 'normal':
             await self.send_normal_reminder(event)
         elif mode == 'many':
-            # 非同期で実行（ループを止めないため）
             asyncio.create_task(self.send_many_reminders(event))
         elif mode == 'brutal':
             asyncio.create_task(self.start_brutal_spam(event))
@@ -250,104 +269,157 @@ class TicketsCog(commands.Cog):
     async def send_normal_reminder(self, event):
         _, participants = await db.get_event_data(event['message_id'])
         if not participants: return
-
         guild = self.bot.get_guild(event['guild_id'])
         if not guild: return
-
         text = self.create_reminder_text(event, "⏰ **まもなく開始です！**")
-
         for uid in participants:
             member = guild.get_member(uid)
             if member:
-                try:
-                    await member.send(text)
-                except discord.Forbidden:
-                    pass
+                try: await member.send(text)
+                except: pass
 
     async def send_many_reminders(self, event):
-        """チャンネルとDMに複数回通知"""
         _, participants = await db.get_event_data(event['message_id'])
         if not participants: return
-
         guild = self.bot.get_guild(event['guild_id'])
         channel = guild.get_channel(event['channel_id']) if guild else None
         
         mentions = " ".join([f"<@{uid}>" for uid in participants])
         text = self.create_reminder_text(event, "⏰ **[しつこめ通知] まもなく開始です！**")
 
-        # 3回繰り返す
         for i in range(3):
-            # チャンネル通知
             if channel:
-                try:
-                    await channel.send(f"{mentions}\n{text}")
-                except:
-                    pass
-            
-            # DM通知
+                try: await channel.send(f"{mentions}\n{text}")
+                except: pass
             for uid in participants:
                 member = guild.get_member(uid)
                 if member:
-                    try:
-                        await member.send(text)
-                    except:
-                        pass
-            
-            await asyncio.sleep(60) # 1分間隔
+                    try: await member.send(text)
+                    except: pass
+            await asyncio.sleep(60)
+
+    # --- 鬼畜モード関連 ---
+
+    def generate_captcha(self, text):
+        """Pillowを使ってコピペ不可能な画像を生成する"""
+        width, height = 300, 100
+        image = Image.new('RGB', (width, height), color=(255, 255, 255))
+        draw = ImageDraw.Draw(image)
+        
+        # ノイズ（点）を描画
+        for _ in range(300):
+            x = random.randint(0, width)
+            y = random.randint(0, height)
+            draw.point((x, y), fill=(random.randint(0, 200), random.randint(0, 200), random.randint(0, 200)))
+        
+        # ノイズ（線）を描画
+        for _ in range(10):
+            x1 = random.randint(0, width)
+            y1 = random.randint(0, height)
+            x2 = random.randint(0, width)
+            y2 = random.randint(0, height)
+            draw.line([(x1, y1), (x2, y2)], fill=(200, 200, 200), width=1)
+
+        # 文字列描画 (デフォルトフォント使用)
+        # 読みやすくするために位置を調整
+        try:
+            # 環境によってはTrueTypeフォントがないため、load_defaultを使う
+            # デフォルトフォントは小さいので、少し工夫が必要だが、ここではシンプルに実装
+            font = ImageFont.load_default()
+            # テキストを中央付近に配置（デフォルトフォントはサイズ変更できないのでそのまま）
+            # もしttfが使える環境なら ImageFont.truetype("arial.ttf", 30) などにする
+            draw.text((20, 40), f"CODE: {text}", fill=(0, 0, 0))
+        except Exception:
+            pass
+        
+        buffer = io.BytesIO()
+        image.save(buffer, format='PNG')
+        buffer.seek(0)
+        return buffer
 
     async def start_brutal_spam(self, event):
-        """解除コード入力まで無限メンション"""
+        """全員が解除するまで止まらないリマインダー"""
         _, participants = await db.get_event_data(event['message_id'])
         if not participants: return
 
         guild = self.bot.get_guild(event['guild_id'])
         channel = guild.get_channel(event['channel_id']) if guild else None
 
-        # 解除コード生成 (長めのランダム文字列)
-        random_suffix = ''.join(random.choices(string.ascii_uppercase + string.digits, k=10))
-        passphrase = f"I_WILL_ATTEND_THE_EVENT_IMMEDIATELY_{random_suffix}"
+        # 参加者ごとにユニークなコードを生成
+        user_codes = {}
+        files_to_send = []
         
-        # 警告送信
-        warning_msg = (
-            f"😈 **鬼畜リマインダー発動** 😈\n\n"
+        warning_text = (
+            f"😈 **鬼畜リマインダー発動** 😈\n"
             f"イベント「{event['title']}」の時間です。\n"
-            f"通知を止めるには、以下のコマンドを正確に入力してください（コピペ推奨）：\n"
-            f"```\n/stop_spam passphrase:{passphrase}\n```"
+            f"**コピペ対策済みです。** 各自、割り当てられた画像のコードを目視で入力して停止してください。\n"
+            f"コマンド: `/stop_spam passphrase:画像に書いてある文字`"
         )
-        
+
+        for uid in participants:
+            # ランダムコード生成
+            code = ''.join(random.choices(string.ascii_uppercase + string.digits, k=8))
+            user_codes[uid] = code
+            
+            # 画像生成
+            img_buffer = self.generate_captcha(code)
+            file = discord.File(fp=img_buffer, filename=f"code_{uid}.png")
+            files_to_send.append(file)
+
+        # メンション作成
         mentions = " ".join([f"<@{uid}>" for uid in participants])
 
+        # コード画像の送信
         if channel:
-            await channel.send(f"{mentions}\n{warning_msg}")
+            await channel.send(f"{mentions}\n{warning_text}")
+            # 複数画像を一括送信（Discordの制限に注意。多すぎる場合は分割が必要だがここでは一括）
+            # ファイル数が多いとエラーになる可能性があるため、参加人数が多い場合は注意が必要
+            # ここでは参加者一人につき1ファイル送信する
+            
+            # 画像と誰宛かを明記して送信
+            for uid, file in zip(participants, files_to_send):
+                await channel.send(f"<@{uid}> さんの解除コード:", file=file)
 
-        # スパムタスク開始
-        task = asyncio.create_task(self.spam_loop(channel, mentions, participants, guild))
-        self.active_spams[event['message_id']] = {'task': task, 'code': passphrase}
+        # スパムタスク管理データの作成
+        # remainingセットに全員を入れる
+        remaining_users = set(participants)
+        
+        task = asyncio.create_task(self.spam_loop(channel, participants, remaining_users, guild))
+        self.active_spams[event['message_id']] = {
+            'task': task, 
+            'codes': user_codes, 
+            'remaining': remaining_users
+        }
 
-    async def spam_loop(self, channel, mentions_str, participant_ids, guild):
+    async def spam_loop(self, channel, all_participants, remaining_users, guild):
         try:
             while True:
-                # チャンネルでメンション
-                if channel:
+                if not remaining_users:
+                    break
+
+                # 残っている人だけをメンション
+                mentions = [f"<@{uid}>" for uid in remaining_users]
+                mentions_str = " ".join(mentions)
+
+                # チャンネル通知
+                if channel and mentions:
                     try:
-                        await channel.send(f"起きろ！！ {mentions_str} 時間だぞ！！")
+                        await channel.send(f"起きろ！！ {mentions_str} まだ解除できてないぞ！！")
                     except:
                         pass
                 
-                # DMでもメンション
-                for uid in participant_ids:
+                # DM通知 (残っている人のみ)
+                for uid in list(remaining_users): # list化して反復中の変更を防ぐ
                     member = guild.get_member(uid)
                     if member:
                         try:
-                            await member.send("⏰ 時間だ！起きろ！早く来い！ ⏰")
+                            await member.send("⏰ 時間だ！コードを入力して解除しろ！ ⏰")
                         except:
                             pass
                 
-                # Discordのレートリミットを考慮しつつもウザい頻度で (約2秒)
-                await asyncio.sleep(2)
+                await asyncio.sleep(2) # 2秒間隔
         except asyncio.CancelledError:
-            if channel:
-                await channel.send("✅ リマインダーが停止されました。")
+            pass
 
     def create_reminder_text(self, event, header):
         return (
